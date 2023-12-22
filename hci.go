@@ -4,10 +4,13 @@ package bluetooth
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"machine"
 	"time"
 )
+
+var _debug = false
 
 const (
 	OGF_LINK_CTL     = 0x01
@@ -24,12 +27,17 @@ const (
 	LE_COMMAND_GENERATE_DH_KEY_V1           = 0x0026
 	LE_COMMAND_GENERATE_DH_KEY_V2           = 0x005E
 
-	LE_META_EVENT_CONN_COMPLETE            = 0x01
-	LE_META_EVENT_ADVERTISING_REPORT       = 0x02
-	LE_META_EVENT_LONG_TERM_KEY_REQUEST    = 0x05
-	LE_META_EVENT_REMOTE_CONN_PARAM_REQ    = 0x06
-	LE_META_EVENT_READ_LOCAL_P256_COMPLETE = 0x08
-	LE_META_EVENT_GENERATE_DH_KEY_COMPLETE = 0x09
+	LE_META_EVENT_CONN_COMPLETE                      = 0x01
+	LE_META_EVENT_ADVERTISING_REPORT                 = 0x02
+	LE_META_EVENT_CONNECTION_UPDATE_COMPLETE         = 0x03
+	LE_META_EVENT_READ_REMOTE_USED_FEATURES_COMPLETE = 0x04
+	LE_META_EVENT_LONG_TERM_KEY_REQUEST              = 0x05
+	LE_META_EVENT_REMOTE_CONN_PARAM_REQ              = 0x06
+	LE_META_EVENT_DATA_LENGTH_CHANGE                 = 0x07
+	LE_META_EVENT_READ_LOCAL_P256_COMPLETE           = 0x08
+	LE_META_EVENT_GENERATE_DH_KEY_COMPLETE           = 0x09
+	LE_META_EVENT_ENHANCED_CONNECTION_COMPLETE       = 0x0A
+	LE_META_EVENT_DIRECT_ADVERTISING_REPORT          = 0x0B
 
 	HCI_COMMAND_PKT  = 0x01
 	HCI_ACLDATA_PKT  = 0x02
@@ -89,6 +97,24 @@ var (
 	ErrHCIUnknown      = errors.New("HCI unknown error")
 )
 
+type leAdvertisingReport struct {
+	reported                    bool
+	status, typ, peerBdaddrType uint8
+	peerBdaddr                  [6]uint8
+	eirLength                   uint8
+	eirData                     [64]uint8
+	rssi                        int8
+}
+
+type leConnectData struct {
+	connected      bool
+	status         uint8
+	handle         uint16
+	role           uint8
+	peerBdaddrType uint8
+	peerBdaddr     [6]uint8
+}
+
 type hci struct {
 	uart              *machine.UART
 	buf               []byte
@@ -97,7 +123,8 @@ type hci struct {
 	cmdCompleteStatus uint8
 	cmdResponse       []byte
 	scanning          bool
-	advData           []byte
+	advData           leAdvertisingReport
+	connectData       leConnectData
 }
 
 func newHCI(uart *machine.UART) *hci {
@@ -107,6 +134,10 @@ func newHCI(uart *machine.UART) *hci {
 }
 
 func (h *hci) start() error {
+	for h.uart.Buffered() > 0 {
+		h.uart.ReadByte()
+	}
+
 	return nil
 }
 
@@ -125,30 +156,35 @@ func (h *hci) poll() error {
 		h.buf[i] = data
 		i++
 
+		//println("hci poll", data)
+
 		switch h.buf[0] {
 		case HCI_ACLDATA_PKT:
-			if i > HCIACLHeaderLen &&
-				i >= (HCIACLHeaderLen+(h.buf[3]+(h.buf[4]<<8))) {
+			if i > HCIACLHeaderLen {
+				if i >= (HCIACLHeaderLen + (h.buf[3] | (h.buf[4] << 8))) {
 
-				return h.handleACLData(h.buf[1:i])
+					//println("hci acl data", h.buf[1], h.buf[2], h.buf[3], h.buf[4], h.buf[5])
+					return h.handleACLData(h.buf[1:i])
+				}
 			}
 
 		case HCI_EVENT_PKT:
 			if i > HCIEvtHeaderLen {
 				if i >= (HCIEvtHeaderLen + h.buf[2]) {
+					//println("hci event", h.buf[1], h.buf[2], h.buf[3], h.buf[4], h.buf[5])
 					return h.handleEventData(h.buf[1:i])
 				}
 			}
 
-		case 0xff:
-			// leftovers in buffer, clear it
-			i = 0
 		default:
-			println("unknown packet type:", h.buf[0])
-			return ErrHCIUnknown
+			if _debug {
+				println("unknown packet data:", h.buf[0])
+			}
+			i = 0
+			//return ErrHCIUnknown
 		}
 
-		time.Sleep(1 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	return nil
@@ -212,11 +248,48 @@ func (h *hci) leSetAdvertiseEnable(enabled bool) error {
 	return h.sendCommandWithParams(OGF_LE_CTL<<10|OCF_LE_SET_ADVERTISE_ENABLE, data[:])
 }
 
+func (h *hci) leCreateConn(interval, window uint16,
+	initiatorFilter, peerBdaddrType uint8,
+	peerBdaddr [6]byte, ownBdaddrType uint8,
+	minInterval, maxInterval, latency, supervisionTimeout, minCeLength, maxCeLength uint16) error {
+	var b [25]byte
+	binary.LittleEndian.PutUint16(b[0:], interval)
+	binary.LittleEndian.PutUint16(b[2:], window)
+	b[4] = initiatorFilter
+	b[5] = peerBdaddrType
+	copy(b[6:], peerBdaddr[:])
+	b[12] = ownBdaddrType
+	binary.LittleEndian.PutUint16(b[13:], minInterval)
+	binary.LittleEndian.PutUint16(b[15:], maxInterval)
+	binary.LittleEndian.PutUint16(b[17:], latency)
+	binary.LittleEndian.PutUint16(b[19:], supervisionTimeout)
+	binary.LittleEndian.PutUint16(b[21:], minCeLength)
+	binary.LittleEndian.PutUint16(b[23:], maxCeLength)
+
+	return h.sendCommandWithParams(OGF_LE_CTL<<10|OCF_LE_CREATE_CONN, b[:])
+}
+
+func (h *hci) leCancelConn() error {
+	return h.sendCommand(OGF_LE_CTL<<10 | OCF_LE_CANCEL_CONN)
+}
+
+func (h *hci) disconnect(handle uint16) error {
+	var b [3]byte
+	binary.LittleEndian.PutUint16(b[0:], handle)
+	b[2] = HCI_OE_USER_ENDED_CONNECTION
+
+	return h.sendCommandWithParams(OGF_LINK_CTL<<10|OCF_DISCONNECT, b[:])
+}
+
 func (h *hci) sendCommand(opcode uint16) error {
 	return h.sendCommandWithParams(opcode, []byte{})
 }
 
 func (h *hci) sendCommandWithParams(opcode uint16, params []byte) error {
+	if _debug {
+		println("hci send command", opcode, hex.EncodeToString(params))
+	}
+
 	h.buf[0] = HCI_COMMAND_PKT
 	h.buf[1] = byte(opcode & 0xff)
 	h.buf[2] = byte(opcode >> 8)
@@ -254,6 +327,9 @@ func (h *hci) handleEventData(buf []byte) error {
 
 	switch evt {
 	case EVT_DISCONN_COMPLETE:
+		if _debug {
+			println("EVT_DISCONN_COMPLETE")
+		}
 		// TODO: something with this data?
 		// status := buf[2]
 		// handle := buf[3] | (buf[4] << 8)
@@ -264,6 +340,9 @@ func (h *hci) handleEventData(buf []byte) error {
 		return h.leSetAdvertiseEnable(true)
 
 	case EVT_ENCRYPTION_CHANGE:
+		if _debug {
+			println("EVT_ENCRYPTION_CHANGE")
+		}
 
 	case EVT_CMD_COMPLETE:
 		h.cmdCompleteOpcode = uint16(buf[3]) | (uint16(buf[4]) << 8)
@@ -274,43 +353,125 @@ func (h *hci) handleEventData(buf []byte) error {
 			h.cmdResponse = buf[:0]
 		}
 
+		if _debug {
+			println("EVT_CMD_COMPLETE", h.cmdCompleteOpcode, h.cmdCompleteStatus)
+		}
+
 		return nil
 
 	case EVT_CMD_STATUS:
-		h.cmdCompleteOpcode = uint16(buf[4]) | uint16(buf[5]<<8)
 		h.cmdCompleteStatus = buf[2]
+		h.cmdCompleteOpcode = uint16(buf[4]) | (uint16(buf[5]) << 8)
+		if _debug {
+			println("EVT_CMD_STATUS", h.cmdCompleteOpcode, h.cmdCompleteOpcode, h.cmdCompleteStatus)
+		}
+
 		h.cmdResponse = buf[:0]
 
 		return nil
 
 	case EVT_NUM_COMP_PKTS:
-
+		if _debug {
+			println("EVT_NUM_COMP_PKTS")
+		}
 	case EVT_LE_META_EVENT:
 		switch buf[2] {
-		case 0x0A:
-			// EvtLeConnectionComplete
+		case LE_META_EVENT_CONN_COMPLETE, LE_META_EVENT_ENHANCED_CONNECTION_COMPLETE:
+			if _debug {
+				println("LE_META_EVENT_CONN_COMPLETE")
+			}
+			h.connectData.connected = true
+			h.connectData.status = buf[3]
+			h.connectData.handle = uint16(buf[4]) | uint16(buf[5])<<8
+			h.connectData.role = buf[6]
+			h.connectData.peerBdaddrType = buf[7]
+			copy(h.connectData.peerBdaddr[:], buf[8:14])
 
-		case LE_META_EVENT_CONN_COMPLETE:
+			return nil
 
 		case LE_META_EVENT_ADVERTISING_REPORT:
-			h.advData = append(buf[:0:0], buf[3:plen+3]...)
+			h.advData.reported = true
+			h.advData.status = buf[3]
+			h.advData.typ = buf[4]
+			h.advData.peerBdaddrType = buf[5]
+			copy(h.advData.peerBdaddr[:], buf[6:12])
+			h.advData.eirLength = buf[12]
+			h.advData.rssi = 0
+			// println("packet length", h.advData.eirLength, plen, len(buf))
+			switch {
+			case int(13+h.advData.eirLength+1) > len(buf):
+				if _debug {
+					println("invalid packet length", h.advData.eirLength, plen, len(buf))
+					println("packet data", hex.EncodeToString(buf))
+				}
+
+				// invalid packet. don't report it.
+				h.clearAdvData()
+			case h.advData.eirLength < 64:
+				copy(h.advData.eirData[0:], buf[13:13+h.advData.eirLength+1])
+
+				if h.advData.status == 0x01 {
+					h.advData.rssi = int8(buf[13+h.advData.eirLength])
+				}
+			}
 
 			return nil
 
 		case LE_META_EVENT_LONG_TERM_KEY_REQUEST:
+			if _debug {
+				println("LE_META_EVENT_LONG_TERM_KEY_REQUEST")
+			}
 
 		case LE_META_EVENT_REMOTE_CONN_PARAM_REQ:
+			if _debug {
+				println("LE_META_EVENT_REMOTE_CONN_PARAM_REQ")
+			}
 
 		case LE_META_EVENT_READ_LOCAL_P256_COMPLETE:
+			if _debug {
+				println("LE_META_EVENT_READ_LOCAL_P256_COMPLETE")
+			}
 
 		case LE_META_EVENT_GENERATE_DH_KEY_COMPLETE:
+			if _debug {
+				println("LE_META_EVENT_GENERATE_DH_KEY_COMPLETE")
+			}
 
 		default:
-			// error unhandled metaevent
+			if _debug {
+				println("unknown metaevent", buf[2], buf[3], buf[4], buf[5])
+			}
+
+			h.clearAdvData()
+			//return ErrHCIUnknownEvent
 		}
 	case EVT_UNKNOWN:
 		return ErrHCIUnknownEvent
 	}
+
+	return nil
+}
+
+func (h *hci) clearAdvData() error {
+	h.advData.reported = false
+	h.advData.status = 0
+	h.advData.typ = 0
+	h.advData.peerBdaddrType = 0
+	h.advData.peerBdaddr = [6]uint8{}
+	h.advData.eirLength = 0
+	h.advData.eirData = [64]uint8{}
+	h.advData.rssi = 0
+
+	return nil
+}
+
+func (h *hci) clearConnectData() error {
+	h.connectData.connected = false
+	h.connectData.status = 0
+	h.connectData.handle = 0
+	h.connectData.role = 0
+	h.connectData.peerBdaddrType = 0
+	h.connectData.peerBdaddr = [6]uint8{}
 
 	return nil
 }
